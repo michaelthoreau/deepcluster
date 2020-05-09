@@ -14,18 +14,18 @@ from torch.utils.data.sampler import Sampler
 import models
 
 
-def load_model(path):
+def load_model(path, loadWeights=True):
     """Loads model and return it without DataParallel table."""
     if os.path.isfile(path):
-        print("=> loading checkpoint '{}'".format(path))
+        print("loading model specified in '{}'  (loading weights: {})".format(path, loadWeights))
         checkpoint = torch.load(path)
 
         # size of the top layer
         N = checkpoint['state_dict']['top_layer.bias'].size()
 
         # build skeleton of the model
-        sob = 'sobel.0.weight' in checkpoint['state_dict'].keys()
-        model = models.__dict__[checkpoint['arch']](sobel=sob, out=int(N[0]))
+      
+        model = models.__dict__[checkpoint['arch']](out=int(N[0]))
 
         # deal with a dataparallel table
         def rename_key(key):
@@ -38,8 +38,8 @@ def load_model(path):
                                     in checkpoint['state_dict'].items()}
 
         # load weights
-        model.load_state_dict(checkpoint['state_dict'])
-        print("Loaded")
+        if loadWeights:
+            model.load_state_dict(checkpoint['state_dict'])
     else:
         model = None
         print("=> no checkpoint found at '{}'".format(path))

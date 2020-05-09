@@ -93,6 +93,6 @@ def make_layers_features(cfg, input_dim, bn):
 
 
 def alexnet(sobel=False, bn=True, out=1000):
-    dim = 2 + int(not sobel)
+    dim = 1
     model = AlexNet(make_layers_features(CFG['2012'], dim, bn=bn), out, sobel)
     return model

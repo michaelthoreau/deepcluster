@@ -73,7 +73,7 @@ class ReassignedDataset(data.Dataset):
         return len(self.imgs)
 
 
-def preprocess_features(npdata, pca=256):
+def preprocess_features(npdata, pca=64):
     """Preprocess an array of features.
     Args:
         npdata (np.array N * ndim): features to preprocess
@@ -137,10 +137,11 @@ def cluster_assign(images_lists, dataset):
         image_indexes.extend(images)
         pseudolabels.extend([cluster] * len(images))
 
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-    t = transforms.Compose([transforms.RandomResizedCrop(224),
-                            transforms.RandomHorizontalFlip(),
+    normalize = transforms.Normalize(mean=[0.1307], std=[0.3081])
+
+    t = transforms.Compose([transforms.RandomHorizontalFlip(),
+                            transforms.Grayscale(),
+                            transforms.RandomAffine(degrees=10, translate=(0.05, 0.05), scale=None, shear=None, resample=False, fillcolor=0),
                             transforms.ToTensor(),
                             normalize])
 
@@ -177,8 +178,8 @@ def run_kmeans(x, nmb_clusters, verbose=False):
     clus.train(x, index)
     _, I = index.search(x, 1)
     losses = faiss.vector_to_array(clus.obj)
-    if verbose:
-        print('k-means loss evolution: {0}'.format(losses))
+    # if verbose:
+    #     print('k-means loss evolution: {0}'.format(losses))
 
     return [int(n[0]) for n in I], losses[-1]
 
@@ -213,8 +214,8 @@ class Kmeans(object):
         for i in range(len(data)):
             self.images_lists[I[i]].append(i)
 
-        if verbose:
-            print('k-means time: {0:.0f} s'.format(time.time() - end))
+        # if verbose:
+        #     print('k-means time: {0:.0f} s'.format(time.time() - end))
 
         return loss
 
