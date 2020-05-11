@@ -8,6 +8,7 @@
 import argparse
 import os
 import time
+import sys
 
 import numpy as np
 import torch
@@ -18,22 +19,26 @@ import torch.utils.data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 
+import csv
+import PIL
+import shutil
+
 from util import AverageMeter, learning_rate_decay, load_model, Logger
 
 parser = argparse.ArgumentParser(description="""Train linear classifier on top
                                  of frozen convolutional layers of an AlexNet.""")
 
-parser.add_argument('--data', type=str, help='path to dataset')
+parser.add_argument('--data_train', type=str, help='path to dataset')
+parser.add_argument('--data_val', type=str, help='path to dataset')
 parser.add_argument('--model', type=str, help='path to model')
 parser.add_argument('--conv', type=int, choices=[1, 2, 3, 4, 5],
                     help='on top of which convolutional layer train logistic regression', default=5)
 parser.add_argument('--tencrops', action='store_true',
                     help='validation accuracy averaged over 10 crops')
-parser.add_argument('--exp', type=str, default='', help='exp folder')
 parser.add_argument('--workers', default=4, type=int,
                     help='number of data loading workers (default: 4)')
-parser.add_argument('--epochs', type=int, default=90, help='number of total epochs to run (default: 90)')
-parser.add_argument('--batch_size', default=10, type=int,
+parser.add_argument('--epochs', type=int, default=50, help='number of total epochs to run (default: 90)')
+parser.add_argument('--batch_size', default=16, type=int,
                     help='mini-batch size (default: 256)')
 parser.add_argument('--lr', default=0.01, type=float, help='learning rate')
 parser.add_argument('--momentum', default=0.9, type=float, help='momentum (default: 0.9)')
@@ -45,11 +50,10 @@ parser.add_argument('--no_freeze', action='store_true', help='freeze the model')
 parser.add_argument('--rand_weights', action='store_true', help='use random weights')
 
 
-
 def main():
     global args
     args = parser.parse_args()
-    
+
     #fix random seeds
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -71,26 +75,54 @@ def main():
     else:
         print("fine tuning conv weights")
 
+    # create csv log
+    exp_folder = os.path.split(os.path.dirname(args.model))[0]
+    if args.rand_weights or args.no_freeze:
+        exp_subfolder = os.path.join(exp_folder, "supervised_rand_" + str(args.data_train.split('_')[-1].split('/')[0]))
+    else:
+        exp_subfolder = os.path.join(exp_folder, "supervised_" + str(args.data_train.split('_')[-1].split('/')[0]))
+    if os.path.exists(exp_subfolder):
+        # shutil.rmtree(exp_subfolder)
+        print("COULD NOT RUN ----------------------------- DELETE EXPERIMENT FOLDER")
+        sys.exit(0)
+    os.makedirs(exp_subfolder)
+    trainLog_supervised = os.path.join(exp_subfolder, "log_supervised_.csv")
+    csvFields = ["epoch", "loss", "prec1", "prec5"]
+    with open(trainLog_supervised, 'w') as f:
+        writer = csv.writer(f)
+        writer.writerow(csvFields)
 
+    print("Unsupervised pre-training: ", exp_folder)
+    print("Training data: ", args.data_train)
+
+    
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
 
-    # data loading code
-    traindir = os.path.join(args.data, 'training')
-    valdir = os.path.join(args.data, 'testing')
-
+    #normalisation values for mnist
     normalize = transforms.Normalize(mean=[0.1307], std=[0.3081])
 
-    transforms_train = [transforms.Grayscale(), transforms.RandomHorizontalFlip(), transforms.ToTensor(), normalize]
-    transforms_val= [transforms.Grayscale(), transforms.ToTensor(), normalize]
+    # transforms - perform random affine transform for training
+    transforms_train = [transforms.Grayscale(), 
+            transforms.RandomAffine(degrees=10, translate=(0.05, 0.05), scale=(0.9, 1.1), shear=(-10, 10), resample=PIL.Image.BICUBIC, fillcolor=0), 
+            transforms.ToTensor(), 
+            normalize]
+    
+    transforms_val= [transforms.Grayscale(), 
+            transforms.ToTensor(), 
+            normalize]
 
     train_dataset = datasets.ImageFolder(
-        traindir,
+        args.data_train,
         transform=transforms.Compose(transforms_train)
     )
+    
+    # modify the number of epochs
+    epoch_scaling = int(np.max([1, 60000/len(train_dataset)/100]))
+    print("Running training {} times per epoch".format(epoch_scaling))
 
     val_dataset = datasets.ImageFolder(
-        valdir,
+        args.data_val,
         transform=transforms.Compose(transforms_val)
     )
     train_loader = torch.utils.data.DataLoader(train_dataset,
@@ -109,6 +141,7 @@ def main():
     # train on all params unless i say so!
     params = list(model.parameters()) + list(reglog.parameters())
 
+    # define optimiser
     optimizer = torch.optim.SGD(
         params,
         args.lr,
@@ -116,43 +149,36 @@ def main():
         weight_decay=10**args.weight_decay
     )
 
-    # create logs
-    exp_log = os.path.join(args.exp, 'log')
-    if not os.path.isdir(exp_log):
-        os.makedirs(exp_log)
-
-    loss_log = Logger(os.path.join(exp_log, 'loss_log'))
-    prec1_log = Logger(os.path.join(exp_log, 'prec1'))
-    prec5_log = Logger(os.path.join(exp_log, 'prec5'))
-
+    # run training and validation
     for epoch in range(args.epochs):
         end = time.time()
 
         # train for one epoch
-        train(train_loader, model, reglog, criterion, optimizer, epoch)
+        for i in range(epoch_scaling):
+            train(train_loader, model, reglog, criterion, optimizer, epoch)
 
         # evaluate on validation set
         prec1, prec5, loss = validate(val_loader, model, reglog, criterion, epoch)
 
-        loss_log.log(loss)
-        prec1_log.log(prec1)
-        prec5_log.log(prec5)
+        with open(trainLog_supervised, 'a') as f:
+            writer = csv.writer(f)
+            writer.writerow([epoch, loss, prec1.item(), prec5.item()])
 
         # remember best prec@1 and save checkpoint
-        is_best = prec1 > best_prec1
-        best_prec1 = max(prec1, best_prec1)
-        if is_best:
-            filename = 'model_best.pth.tar'
-        else:
-            filename = 'checkpoint.pth.tar'
-        torch.save({
-            'epoch': epoch + 1,
-            'arch': 'alexnet',
-            'state_dict': model.state_dict(),
-            'prec5': prec5,
-            'best_prec1': best_prec1,
-            'optimizer' : optimizer.state_dict(),
-        }, os.path.join(args.exp, filename))
+        # is_best = prec1 > best_prec1
+        # best_prec1 = max(prec1, best_prec1)
+        # if is_best:
+        #     filename = 'model_best.pth.tar'
+        # else:
+        #     filename = 'checkpoint.pth.tar'
+        # torch.save({
+        #     'epoch': epoch + 1,
+        #     'arch': 'alexnet',
+        #     'state_dict': model.state_dict(),
+        #     'prec5': prec5,
+        #     'best_prec1': best_prec1,
+        #     'optimizer' : optimizer.state_dict(),
+        # }, os.path.join(args.exp, filename))
 
 
 class RegLog(nn.Module):
@@ -211,18 +237,13 @@ def accuracy(output, target, topk=(1,)):
     return res
 
 def train(train_loader, model, reglog, criterion, optimizer, epoch):
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
 
-
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
 
-        # measure data loading time
-        data_time.update(time.time() - end)
 
         #adjust learning rate
         learning_rate_decay(optimizer, len(train_loader) * epoch + i, args.lr)
@@ -236,6 +257,7 @@ def train(train_loader, model, reglog, criterion, optimizer, epoch):
 
         output = reglog(output)
         loss = criterion(output, target_var)
+
         # measure accuracy and record loss
         prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
         losses.update(loss.item(), input.size(0))
@@ -247,9 +269,6 @@ def train(train_loader, model, reglog, criterion, optimizer, epoch):
         loss.backward()
         optimizer.step()
 
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
 
         # if args.verbose and i  == len(train_loader) - 1:
         #     print('Epoch: [{0}][{1}/{2}]\t'
@@ -263,16 +282,13 @@ def train(train_loader, model, reglog, criterion, optimizer, epoch):
 
 
 def validate(val_loader, model, reglog, criterion, epoch):
-    batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
-    data_time = AverageMeter()
 
     softmax = nn.Softmax(dim=1).cuda()
     end = time.time()
     for i, (input_tensor, target) in enumerate(val_loader):
-        data_time.update(time.time() - end)
 
         target = target.cuda()
         with torch.no_grad():
@@ -293,20 +309,16 @@ def validate(val_loader, model, reglog, criterion, epoch):
         losses.update(loss.item(), input_tensor.size(0))
 
         # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
 
         if args.verbose and i  == len(val_loader) - 1:
             print('Validation: [{0}]    '
-                  'Time: {batch_time.avg:.2f}    '
-                  'Data: {data_time.avg:.2f}    '
                   'Loss: {loss.avg:.2f}    '
                   'Prec@1: {top1.avg:.1f}    '
                   'Prec@5: {top5.avg:.1f}'
-                  .format(epoch, batch_time=batch_time,
-                   data_time=data_time, loss=losses, top1=top1, top5=top5))
+                  .format(epoch, loss=losses, top1=top1, top5=top5))
 
     return top1.avg, top5.avg, losses.avg
 
 if __name__ == '__main__':
     main()
+    print("STOPPING-----------------")
